@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "big-data-doc-auto-shell"
+version = "0.1.0"
+description = "文档自动提取关键信息系统 - 使用LLM自动分类和提取Word/PDF文档关键信息"
+readme = "设计思路.md"
+requires-python = ">=3.11,<3.12"
+license = "MIT"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+keywords = ["document", "nlp", "llm", "extraction", "classification"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+]
+
+dependencies = [
+    "python-docx>=1.1.2",      # 处理Word文档（.docx格式）
+    "pdfplumber>=0.11.4",      # 处理PDF文档（最新稳定版，比PyPDF2更强大）
+    "openai>=1.54.0",          # 调用Qwen大模型API（兼容OpenAI接口，最新稳定版）
+    "openpyxl>=3.1.5",         # 操作Excel文件（最新稳定版）
+    "pandas>=2.2.2",           # 数据处理（用于Excel操作，最新稳定版）
+    "python-dotenv>=1.0.1",    # 管理环境变量（API密钥，最新稳定版）
+    "rich>=13.7.0",            # 终端美化库，用于进度条、表格、实时显示等
+]
+
+
+[project.scripts]
+doc-extract = "main:main"
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.txt", "*.md"]
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
