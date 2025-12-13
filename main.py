@@ -2,6 +2,7 @@
 import sys
 import logging
 import time
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -106,7 +107,7 @@ class DocumentProcessor:
         try:
             # 1. 读取文档
             self.update_status(index, total, '读取', file_name)
-            self._render_display(index, total, file_name)
+            self._render_display(index, total, file_name, "📖 正在读取文档...")
             content = self.reader.read_document(file_path)
             if not content:
                 raise ValueError("无法读取文档内容")
@@ -116,14 +117,14 @@ class DocumentProcessor:
             
             # 2. 文档分类
             self.update_status(index, total, '分类', file_name)
-            self._render_display(index, total, file_name)
+            self._render_display(index, total, file_name, "🏷️ 正在分类文档...")
             doc_type = self.classifier.classify(content, file_name)
             if not doc_type:
                 raise ValueError("文档分类失败")
             
             # 3. 信息提取
             self.update_status(index, total, '提取', file_name)
-            self._render_display(index, total, file_name)
+            self._render_display(index, total, file_name, "🔍 正在提取信息...")
             data = self.extractor.extract(content, doc_type, file_name)
             if not data:
                 raise ValueError("信息提取失败")
@@ -133,14 +134,14 @@ class DocumentProcessor:
             
             # 4. 保存数据
             self.update_status(index, total, '保存', file_name)
-            self._render_display(index, total, file_name)
+            self._render_display(index, total, file_name, "💾 正在保存数据...")
             success = self.storage.save_data(data, doc_type)
             if not success:
                 raise ValueError("数据保存失败")
             
             # 5. 成功
             self.update_status(index, total, '成功', file_name, f"→ {doc_type}")
-            self._render_display(index, total, file_name)
+            self._render_display(index, total, file_name, f"✓ 处理成功 → {doc_type}")
             return True
             
         except Exception as e:
@@ -157,7 +158,7 @@ class DocumentProcessor:
                 'error': error_msg,
                 'simplified_error': simplified_error
             })
-            self._render_display(index, total, file_name)
+            self._render_display(index, total, file_name, f"✗ 处理失败 - {simplified_error}")
             return False
     
     def _simplify_error(self, error_msg: str, file_name: str) -> str:
@@ -213,7 +214,7 @@ class DocumentProcessor:
             else:
                 return simplified.strip()[:50]  # 限制长度
     
-    def _render_display(self, index: int, total: int, current_file: str):
+    def _render_display(self, index: int, total: int, current_file: str, status: str = ""):
         """渲染显示界面"""
         from datetime import datetime
         
@@ -226,11 +227,63 @@ class DocumentProcessor:
             start_time=datetime.fromtimestamp(self.stats['start_time']) if self.stats['start_time'] else None
         )
         
-        # 渲染显示（rich会自动处理）
-        self.display.render([], current_file, "")
+        # 渲染显示
+        self.display.render([], current_file, status)
     
     def print_summary(self):
-        """打印统计信息（使用rich显示）"""
+        """打印统计信息（已在处理完成后通过 Textual UI 显示，此方法保留用于兼容性）"""
+        # 总结信息已经在处理完成后通过 SummaryScreen 显示
+        # 此方法保留用于兼容性，但不再需要执行任何操作
+        pass
+    
+    def _process_files_in_thread(self, files):
+        """在后台线程中处理文件"""
+        try:
+            self.stats['total'] = len(files)
+            self.stats['start_time'] = time.time()
+            
+            # 初始化统计信息显示
+            from datetime import datetime
+            self.display.update_stats(
+                index=0,
+                total=self.stats['total'],
+                success=0,
+                failed=0,
+                start_time=datetime.fromtimestamp(self.stats['start_time'])
+            )
+            
+            self.display.add_log(f"开始处理 {self.stats['total']} 个文件")
+            
+            # 处理每个文件
+            for index, file_path in enumerate(files, 1):
+                success = self.process_file(file_path, index, len(files))
+                
+                if success:
+                    self.stats['success'] += 1
+                else:
+                    self.stats['failed'] += 1
+            
+            # 记录结束时间
+            self.stats['end_time'] = time.time()
+            
+            # 准备总结数据并切换到总结界面
+            if self.display.app:
+                def show_summary_screen():
+                    # 准备总结数据
+                    summary_data = self._prepare_summary_data()
+                    # 切换到总结界面
+                    from src.display import SummaryScreen
+                    summary_screen = SummaryScreen(summary_data)
+                    self.display.app.push_screen(summary_screen)
+                
+                self.display.app.call_from_thread(show_summary_screen)
+        except Exception as e:
+            logger.error(f"文件处理失败: {e}", exc_info=True)
+            if self.display.app:
+                self.display.app.call_from_thread(self.display.app.exit)
+    
+    def _prepare_summary_data(self) -> dict:
+        """准备总结数据"""
         duration = self.stats['end_time'] - self.stats['start_time']
         minutes = int(duration // 60)
         seconds = int(duration % 60)
@@ -263,8 +316,7 @@ class DocumentProcessor:
                         'records': f"统计失败 ({e})"
                     })
         
-        # 准备总结数据
-        summary_data = {
+        return {
             'total': self.stats['total'],
             'success': self.stats['success'],
             'failed': self.stats['failed'],
@@ -274,9 +326,6 @@ class DocumentProcessor:
             'output_files': output_files_info,
             'total_output_records': total_output_records,
         }
-        
-        # 使用rich显示总结
-        self.display.show_summary(summary_data)
     
     def run(self):
         """运行主程序"""
@@ -297,30 +346,28 @@ class DocumentProcessor:
                 print("未找到任何文档文件！")
                 return
             
-            self.stats['total'] = len(files)
-            self.stats['start_time'] = time.time()
+            # 初始化显示（返回 App 实例）
+            app = self.display.init_display()
             
-            # 初始化显示
-            self.display.init_display()
-            self.display.add_log(f"开始处理 {self.stats['total']} 个文件")
+            # 在后台线程中启动文件处理
+            processing_thread = threading.Thread(
+                target=self._process_files_in_thread,
+                args=(files,),
+                daemon=False
+            )
+            processing_thread.start()
             
-            # 处理每个文件
-            for index, file_path in enumerate(files, 1):
-                success = self.process_file(file_path, index, len(files))
-                
-                if success:
-                    self.stats['success'] += 1
-                else:
-                    self.stats['failed'] += 1
+            # 在主线程运行 Textual App（这会阻塞直到 App 退出）
+            try:
+                app.run()
+            except KeyboardInterrupt:
+                pass
             
-            # 记录结束时间
-            self.stats['end_time'] = time.time()
+            # 等待处理线程完成（总结信息会在处理完成后自动显示）
+            processing_thread.join(timeout=5.0)
             
-            # 清理显示
+            # 清理显示（App 会在用户按 Q 键后退出）
             self.display.cleanup_display()
-            
-            # 打印最终统计信息
-            self.print_summary()
             
         except KeyboardInterrupt:
             self.display.cleanup_display()
