@@ -17,8 +17,13 @@ class InformationExtractor:
     EXTRACTION_PROMPTS = {
         "办会材料信息": """你是一个信息提取专家。请从以下文档中提取关键信息，并以JSON格式返回。
 
+文档文件名：
+{file_name}
+
 文档内容（可能来自Word或PDF文件）：
 {content}
+
+重要提示：文件名中可能包含重要信息（如发文文号、文件类型、单位名称、日期等），请充分利用文件名信息辅助提取。如果文件名和文档内容中的信息不一致，优先使用文档内容中的信息。
 
 请提取以下字段：
 - PolicyCategory（文件类别）：会议通知、会议方案、会议纪要、其他
@@ -45,15 +50,21 @@ class InformationExtractor:
         
         "办文材料信息": """你是一个信息提取专家。请从以下文档中提取关键信息，并以JSON格式返回。
 
+文档文件名：
+{file_name}
+
 文档内容（可能来自Word或PDF文件）：
 {content}
+
+重要提示：文件名中可能包含重要信息（如发文文号、文件类型、单位名称、日期等），请充分利用文件名信息辅助提取。如果文件名和文档内容中的信息不一致，优先使用文档内容中的信息。
 
 请提取以下字段：
 - PolicyCategory（文件类别）：工作总结、工作报告、工作要点、交流谈话、工作调研、工作要求、其他
 - IssuingAuthority（所属单位）：发文单位
 - EffectiveDate（成文日期）：格式为YYYY-MM-DD
-- Position（材料层级）：科级、处级、局级（地厅级）、省部级、国家级
-  注意：重庆是直辖市，行政级别与其他市不同。重庆市级会议相当于省部级，重庆区级会议相当于局级（地厅级），重庆区级部门会议相当于处级，重庆街道/镇级会议相当于科级。
+- Position（材料层级）：必须严格匹配以下四个值之一，不能自行创建新的值：
+  市领导、厅局级、处级、科级
+  注意：必须从上述四个值中选择，不能使用其他值（如局级、地厅级、省部级、国家级等）。如果无法明确判断层级，请根据文档内容选择最接近的层级。
 - ObjectOriented（面向对象）：涉及到各有关单位等相关模糊名称的，使用各区级单位、镇街
 - Topic（主题分类）：必须严格匹配以下类别之一，请仔细分析文档内容，选择最准确的类别：
   社会服务与治理、食品药品安全、教育、卫生健康与医疗、商务、经济与金融、环境保护与生态文明、创新创业发展、农业农村发展、工业和信息化、文化与旅游、城市建设与规划、国家能源发展与规划、网络与信息安全、国际交流与合作、交通管理与规划、其他
@@ -77,8 +88,13 @@ class InformationExtractor:
         
         "政策文件信息": """你是一个信息提取专家。请从以下文档中提取关键信息，并以JSON格式返回。
 
+文档文件名：
+{file_name}
+
 文档内容（可能来自Word或PDF文件）：
 {content}
+
+重要提示：文件名中可能包含重要信息（如发文文号、文件类型、单位名称、日期等），请充分利用文件名信息辅助提取。特别是发文文号（DocumentNumber）可能出现在文件名中。如果文件名和文档内容中的信息不一致，优先使用文档内容中的信息。
 
 请提取以下字段：
 - PolicyCategory（政策类别）：党内法规与党建制度、国务院文件、国家各部委规章、地方法规、政府规章、行政规范性文件、政策解读、其他文件
@@ -141,8 +157,11 @@ class InformationExtractor:
             logger.error(f"不支持的文档类型: {doc_type}")
             return None
         
-        # 在Prompt中包含文件名信息
-        prompt = self.EXTRACTION_PROMPTS[doc_type].format(content=content)
+        # 在Prompt中包含文件名和内容信息
+        prompt = self.EXTRACTION_PROMPTS[doc_type].format(
+            file_name=file_name if file_name else "未知文件名",
+            content=content
+        )
         
         for attempt in range(MAX_RETRIES):
             try:
@@ -251,6 +270,11 @@ class InformationExtractor:
             "交通管理与规划", "其他"
         ]
         
+        # Position字段的合法值列表（材料层级）
+        VALID_POSITIONS = [
+            "市领导", "厅局级", "处级", "科级"
+        ]
+        
         cleaned = {}
         
         for key, value in data.items():
@@ -279,6 +303,53 @@ class InformationExtractor:
                         if not matched:
                             logger.warning(f"Topic字段值 '{value}' 不在合法列表中，已设置为'其他'")
                             value = "其他"
+                
+                # 验证Position字段（材料层级）
+                if key == "Position" and value:
+                    # 检查是否严格匹配合法值
+                    if value not in VALID_POSITIONS:
+                        # 尝试映射常见的错误值
+                        position_mapping = {
+                            "局级": "厅局级",
+                            "局级（地厅级）": "厅局级",
+                            "地厅级": "厅局级",
+                            "区级（地厅级）": "厅局级",
+                            "省部级": "市领导",
+                            "国家级": "市领导",
+                            "厅级": "厅局级",
+                            "局级(地厅级)": "厅局级",
+                            "区级(地厅级)": "厅局级",
+                        }
+                        
+                        # 先尝试直接映射
+                        if value in position_mapping:
+                            value = position_mapping[value]
+                            logger.warning(f"Position字段值 '{data.get(key)}' 已映射为 '{value}'")
+                        else:
+                            # 尝试模糊匹配
+                            normalized_value = value.replace(" ", "").replace("（", "(").replace("）", ")")
+                            matched = False
+                            
+                            # 检查是否包含关键词
+                            if "市领导" in value or "省部级" in value or "国家级" in value:
+                                value = "市领导"
+                                matched = True
+                            elif "厅局级" in value or "局级" in value or "地厅级" in value:
+                                value = "厅局级"
+                                matched = True
+                            elif "处级" in value:
+                                value = "处级"
+                                matched = True
+                            elif "科级" in value:
+                                value = "科级"
+                                matched = True
+                            
+                            if matched:
+                                logger.warning(f"Position字段值 '{data.get(key)}' 已修正为 '{value}'")
+                            else:
+                                # 如果无法匹配，设置为"处级"（默认值）
+                                logger.warning(f"Position字段值 '{value}' 不在合法列表中，已设置为'处级'")
+                                value = "处级"
             
             cleaned[key] = value
         
