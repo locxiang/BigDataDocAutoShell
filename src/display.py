@@ -227,12 +227,16 @@ class ProcessingApp(App):
         # 其他按键不做处理，让 Textual 正常处理
     
     def _refresh_display(self) -> None:
-        """定时刷新显示"""
+        """定时刷新显示（基于主进程的计数器）"""
         try:
-            # 更新统计信息（包括重新计算耗时和速度）
+            # 从主进程的计数器获取最新数据
             total = self.stats.get('total', 0)
-            index = self.stats.get('index', 0)
+            success = self.stats.get('success', 0)
+            failed = self.stats.get('failed', 0)
             start_time = self.stats.get('start_time')
+            
+            # 计算已处理数量（基于主进程的计数器）
+            processed_count = success + failed
             
             if start_time and total > 0:
                 # 重新计算耗时和速度
@@ -242,13 +246,20 @@ class ProcessingApp(App):
                 else:
                     self.elapsed_time = f"{int(elapsed)}秒"
                 
-                if elapsed > 0 and index > 0:
-                    self.speed = index / elapsed * 60
+                if elapsed > 0 and processed_count > 0:
+                    self.speed = processed_count / elapsed * 60
                 else:
                     self.speed = 0.0
                 
-                # 更新进度（这会触发 watch_progress_percent）
-                self.progress_percent = (index / total) * 100
+                # 更新进度（基于已处理数量，确保只增不减）
+                if total > 0:
+                    progress = min(100.0, (processed_count / total) * 100)
+                    if progress > self.progress_percent:
+                        self.progress_percent = progress
+                
+                # 更新成功和失败计数
+                self.success_count = success
+                self.failed_count = failed
             
             # 更新统计信息显示和进度条
             self.update_stats_display()
@@ -296,23 +307,28 @@ class ProcessingApp(App):
             pass
     
     def update_stats_display(self) -> None:
-        """更新统计信息显示"""
+        """更新统计信息显示（基于主进程的计数器）"""
         try:
             stats_text = self.query_one("#stats-text", Static)
             if not stats_text:
-                # 调试：记录找不到元素的情况
                 return
             
+            # 从主进程的计数器获取数据
             total = self.stats.get('total', 0)
-            index = self.stats.get('index', 0)
+            success = self.stats.get('success', 0)
+            failed = self.stats.get('failed', 0)
+            
+            # 计算已处理数量（基于主进程的计数器）
+            processed_count = success + failed
             
             if total > 0:
-                progress_pct = int((index / total) * 100)
+                # 计算进度百分比
+                progress_pct = int((processed_count / total) * 100)
                 # Textual 不支持 rich markup，使用纯文本
                 stats_display = (
-                    f"进度: {progress_pct}% ({index}/{total})  |  "
-                    f"成功: {self.success_count}  |  "
-                    f"失败: {self.failed_count}  |  "
+                    f"进度: {progress_pct}% ({processed_count}/{total})  |  "
+                    f"成功: {success}  |  "
+                    f"失败: {failed}  |  "
                     f"速度: {self.speed:.1f} 文件/分钟  |  "
                     f"耗时: {self.elapsed_time}"
                 )
@@ -320,10 +336,8 @@ class ProcessingApp(App):
                 stats_display = "等待开始..."
             
             stats_text.update(stats_display)
-        except Exception as e:
-            # 调试：记录异常以便排查问题
-            import traceback
-            # 只在开发时输出，避免影响用户体验
+        except Exception:
+            # 静默处理异常，避免影响主流程
             pass
     
     def update_display(self) -> None:
@@ -369,7 +383,13 @@ class ProcessingApp(App):
             self.update_log_display()
     
     def update_stats(self, **kwargs) -> None:
-        """更新统计信息"""
+        """
+        更新统计信息（基于主进程的计数器，线程安全）
+        
+        核心逻辑：
+        - 进度 = (success_count + failed_count) / total
+        - 所有数据都来自主进程的计数器，确保一致性
+        """
         # 更新 stats 字典
         for key, value in kwargs.items():
             if key == 'start_time':
@@ -382,23 +402,31 @@ class ProcessingApp(App):
             else:
                 self.stats[key] = value
         
-        # 计算并更新响应式属性（这会触发 watch 方法）
+        # 从主进程的计数器获取数据（这些值已经在主进程中线程安全地更新）
         total = self.stats.get('total', 0)
-        index = self.stats.get('index', 0)
         success = self.stats.get('success', 0)
         failed = self.stats.get('failed', 0)
         start_time = self.stats.get('start_time')
         
+        # 计算已处理数量（基于主进程的计数器）
+        processed_count = success + failed
+        
         # 更新响应式属性（这会自动触发 watch 方法）
+        # 进度计算：已处理数量 / 总数量
         if total > 0:
-            self.progress_percent = (index / total) * 100
+            # 确保进度不超过100%，且只增不减
+            progress = min(100.0, (processed_count / total) * 100)
+            # 确保进度只增不减（防止并发更新导致倒退）
+            if progress > self.progress_percent:
+                self.progress_percent = progress
         else:
             self.progress_percent = 0.0
         
+        # 更新成功和失败计数
         self.success_count = success
         self.failed_count = failed
         
-        # 计算耗时和速度
+        # 计算耗时和速度（基于已处理数量）
         if start_time:
             elapsed = (datetime.now() - start_time).total_seconds()
             if elapsed >= 60:
@@ -406,8 +434,8 @@ class ProcessingApp(App):
             else:
                 self.elapsed_time = f"{int(elapsed)}秒"
             
-            if elapsed > 0 and index > 0:
-                self.speed = index / elapsed * 60
+            if elapsed > 0 and processed_count > 0:
+                self.speed = processed_count / elapsed * 60
             else:
                 self.speed = 0.0
         else:

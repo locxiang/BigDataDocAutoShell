@@ -56,7 +56,7 @@ class DocumentReader:
             data_dir: 数据目录路径
             
         Returns:
-            文件路径列表
+            文件路径列表（按创建时间倒序排列，最新的文件在前）
         """
         files = []
         
@@ -67,9 +67,24 @@ class DocumentReader:
         for ext in DocumentReader.WORD_EXTENSIONS | DocumentReader.PDF_EXTENSIONS:
             files.extend(data_dir.glob(f"*{ext}"))
         
-        # 去重并排序
-        files = sorted(set(files))
-        logger.info(f"扫描到 {len(files)} 个文档文件")
+        # 去重并按创建时间倒序排序（最新的文件在前）
+        files = list(set(files))
+        
+        # 按照文件创建时间倒序排序
+        def get_creation_time(file_path: Path) -> float:
+            """获取文件创建时间"""
+            try:
+                stat = file_path.stat()
+                # macOS 使用 st_birthtime，Linux/Windows 使用 st_ctime
+                if hasattr(stat, 'st_birthtime'):
+                    return stat.st_birthtime
+                else:
+                    return stat.st_ctime
+            except (OSError, AttributeError):
+                return 0.0
+        
+        files.sort(key=get_creation_time, reverse=True)
+        logger.info(f"扫描到 {len(files)} 个文档文件（按创建时间倒序排列，最新的文件优先处理）")
         
         return files
     

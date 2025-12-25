@@ -5,8 +5,9 @@ import time
 import threading
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from src.config import validate_config, DATA_DIR, OUTPUT_DIR
+from src.config import validate_config, DATA_DIR, OUTPUT_DIR, MAX_WORKERS
 from src.document_reader import DocumentReader
 from src.document_classifier import DocumentClassifier
 from src.information_extractor import InformationExtractor
@@ -44,6 +45,8 @@ class DocumentProcessor:
             'start_time': None,
             'end_time': None,
         }
+        # 线程安全的统计锁（保护主进程的计数器）
+        self.stats_lock = threading.Lock()
     
     def print_header(self):
         """打印启动信息"""
@@ -152,12 +155,13 @@ class DocumentProcessor:
             simplified_error = self._simplify_error(error_msg, file_name)
             self.update_status(index, total, '失败', file_name, f"- {simplified_error}")
             
-            # 保存完整错误信息到统计中
-            self.stats['failed_files'].append({
-                'file': file_name,
-                'error': error_msg,
-                'simplified_error': simplified_error
-            })
+            # 线程安全地保存完整错误信息到统计中
+            with self.stats_lock:
+                self.stats['failed_files'].append({
+                    'file': file_name,
+                    'error': error_msg,
+                    'simplified_error': simplified_error
+                })
             self._render_display(index, total, file_name, f"✗ 处理失败 - {simplified_error}")
             return False
     
@@ -214,13 +218,21 @@ class DocumentProcessor:
             else:
                 return simplified.strip()[:50]  # 限制长度
     
-    def _render_display(self, index: int, total: int, current_file: str, status: str = ""):
-        """渲染显示界面"""
+    def _render_display(self, processed_count: int, total: int, current_file: str, status: str = ""):
+        """
+        渲染显示界面
+        
+        Args:
+            processed_count: 已处理数量（基于主进程的计数器：success + failed）
+            total: 总文件数
+            current_file: 当前处理的文件名
+            status: 状态信息
+        """
         from datetime import datetime
         
-        # 更新显示统计信息
+        # 更新显示统计信息（传入主进程的计数器值）
+        # 注意：这里传入 processed_count 只是为了兼容性，实际进度计算在 update_stats 中基于 success + failed
         self.display.update_stats(
-            index=index,
             total=total,
             success=self.stats['success'],
             failed=self.stats['failed'],
@@ -237,10 +249,14 @@ class DocumentProcessor:
         pass
     
     def _process_files_in_thread(self, files):
-        """在后台线程中处理文件"""
+        """在后台线程中并发处理文件"""
         try:
             self.stats['total'] = len(files)
             self.stats['start_time'] = time.time()
+            # 重置计数器（线程安全）
+            with self.stats_lock:
+                self.stats['success'] = 0
+                self.stats['failed'] = 0
             
             # 初始化统计信息显示
             from datetime import datetime
@@ -252,16 +268,54 @@ class DocumentProcessor:
                 start_time=datetime.fromtimestamp(self.stats['start_time'])
             )
             
-            self.display.add_log(f"开始处理 {self.stats['total']} 个文件")
+            self.display.add_log(f"开始并发处理 {self.stats['total']} 个文件（并发数: {MAX_WORKERS}）")
             
-            # 处理每个文件
-            for index, file_path in enumerate(files, 1):
-                success = self.process_file(file_path, index, len(files))
+            # 使用线程池并发处理文件
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                # 提交所有任务
+                future_to_file = {
+                    executor.submit(self._process_single_file, file_path, index, len(files)): (file_path, index)
+                    for index, file_path in enumerate(files, 1)
+                }
                 
-                if success:
-                    self.stats['success'] += 1
-                else:
-                    self.stats['failed'] += 1
+                # 处理完成的任务
+                for future in as_completed(future_to_file):
+                    file_path, original_index = future_to_file[future]
+                    try:
+                        success = future.result()
+                        
+                        # 线程安全地更新主进程的计数器
+                        with self.stats_lock:
+                            if success:
+                                self.stats['success'] += 1
+                            else:
+                                self.stats['failed'] += 1
+                            # 计算已处理数量（基于计数器）
+                            processed_count = self.stats['success'] + self.stats['failed']
+                        
+                        # 更新显示（线程安全，Display类内部会使用call_from_thread）
+                        # 传入主进程的计数器值，确保进度准确
+                        self._render_display(
+                            processed_count,
+                            self.stats['total'],
+                            file_path.name,
+                            f"已完成 {processed_count}/{self.stats['total']}"
+                        )
+                    except Exception as e:
+                        logger.error(f"处理文件时出错: {file_path.name}, 错误: {e}", exc_info=True)
+                        # 线程安全地更新主进程的计数器
+                        with self.stats_lock:
+                            self.stats['failed'] += 1
+                            # 计算已处理数量（基于计数器）
+                            processed_count = self.stats['success'] + self.stats['failed']
+                        
+                        # 更新显示
+                        self._render_display(
+                            processed_count,
+                            self.stats['total'],
+                            file_path.name,
+                            f"处理异常"
+                        )
             
             # 记录结束时间
             self.stats['end_time'] = time.time()
@@ -281,6 +335,20 @@ class DocumentProcessor:
             logger.error(f"文件处理失败: {e}", exc_info=True)
             if self.display.app:
                 self.display.app.call_from_thread(self.display.app.exit)
+    
+    def _process_single_file(self, file_path: Path, index: int, total: int) -> bool:
+        """
+        处理单个文件（用于并发执行）
+        
+        Args:
+            file_path: 文件路径
+            index: 文件索引
+            total: 总文件数
+            
+        Returns:
+            是否处理成功
+        """
+        return self.process_file(file_path, index, total)
     
     def _prepare_summary_data(self) -> dict:
         """准备总结数据"""

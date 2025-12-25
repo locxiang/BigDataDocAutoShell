@@ -2,6 +2,7 @@
 import logging
 import json
 import re
+import threading
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
@@ -16,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 class QAGenerator:
     """政策问答对生成器"""
+    
+    # 类级别的文件锁，保护Excel文件写入
+    _file_lock = threading.Lock()
     
     # 生成问答对的Prompt模板
     QA_GENERATION_PROMPT = """你是一个专业的政策解读专家。请根据以下政策文件信息，生成10个问答对。
@@ -299,7 +303,7 @@ class QAGenerator:
     
     def save_qa_pairs(self, qa_pairs: List[Dict[str, Any]], policy: Dict[str, Any]) -> bool:
         """
-        保存问答对到Excel
+        保存问答对到Excel（线程安全）
         
         Args:
             qa_pairs: 问答对列表
@@ -308,113 +312,115 @@ class QAGenerator:
         Returns:
             是否保存成功
         """
-        try:
-            # 获取输出文件路径
-            template_name = TEMPLATE_MAPPING.get("政策问答对")
-            if not template_name:
-                raise ValueError("未找到政策问答对模板文件")
-            
-            output_file = OUTPUT_DIR / template_name
-            
-            # 如果输出文件不存在，从模板复制
-            if not output_file.exists():
-                template_file = TEMPLATE_DIR / template_name
-                if template_file.exists():
-                    import shutil
-                    shutil.copy2(template_file, output_file)
-                    logger.info(f"从模板创建输出文件: {output_file}")
+        # 使用类级别的锁保护Excel文件写入操作
+        with self._file_lock:
+            try:
+                # 获取输出文件路径
+                template_name = TEMPLATE_MAPPING.get("政策问答对")
+                if not template_name:
+                    raise ValueError("未找到政策问答对模板文件")
+                
+                output_file = OUTPUT_DIR / template_name
+                
+                # 如果输出文件不存在，从模板复制
+                if not output_file.exists():
+                    template_file = TEMPLATE_DIR / template_name
+                    if template_file.exists():
+                        import shutil
+                        shutil.copy2(template_file, output_file)
+                        logger.info(f"从模板创建输出文件: {output_file}")
+                    else:
+                        # 创建新的Excel文件
+                        wb = Workbook()
+                        ws = wb.active
+                        ws.title = "YS"
+                        # 添加表头
+                        headers = ["XH", "ID", "SourceDepartment", "Problem", "Answer", 
+                                  "PolicyName", "DocumentNumber", "Fields", "Remarks"]
+                        ws.append(headers)
+                        wb.save(output_file)
+                        logger.info(f"创建新的输出文件: {output_file}")
+                
+                # 加载工作簿
+                wb = load_workbook(output_file)
+                if "YS" in wb.sheetnames:
+                    ws = wb["YS"]
                 else:
-                    # 创建新的Excel文件
-                    wb = Workbook()
                     ws = wb.active
-                    ws.title = "YS"
-                    # 添加表头
+                    if ws.title != "YS":
+                        ws.title = "YS"
+                
+                # 获取表头
+                headers = []
+                header_keys = []
+                if ws.max_row > 0:
+                    for cell in ws[1]:
+                        header_value = cell.value if cell.value else ""
+                        headers.append(header_value)
+                        key = self._extract_key_from_header(header_value)
+                        header_keys.append(key)
+                
+                # 如果没有表头，创建表头
+                if not headers or not any(headers):
                     headers = ["XH", "ID", "SourceDepartment", "Problem", "Answer", 
                               "PolicyName", "DocumentNumber", "Fields", "Remarks"]
+                    header_keys = headers.copy()
                     ws.append(headers)
-                    wb.save(output_file)
-                    logger.info(f"创建新的输出文件: {output_file}")
-            
-            # 加载工作簿
-            wb = load_workbook(output_file)
-            if "YS" in wb.sheetnames:
-                ws = wb["YS"]
-            else:
-                ws = wb.active
-                if ws.title != "YS":
-                    ws.title = "YS"
-            
-            # 获取表头
-            headers = []
-            header_keys = []
-            if ws.max_row > 0:
-                for cell in ws[1]:
-                    header_value = cell.value if cell.value else ""
-                    headers.append(header_value)
-                    key = self._extract_key_from_header(header_value)
-                    header_keys.append(key)
-            
-            # 如果没有表头，创建表头
-            if not headers or not any(headers):
-                headers = ["XH", "ID", "SourceDepartment", "Problem", "Answer", 
-                          "PolicyName", "DocumentNumber", "Fields", "Remarks"]
-                header_keys = headers.copy()
-                ws.append(headers)
-            
-            # 获取当前最大序号
-            max_xh = 0
-            if "XH" in header_keys:
-                xh_col = header_keys.index("XH") + 1
-                for row in range(2, ws.max_row + 1):
-                    cell_value = ws.cell(row, xh_col).value
-                    if isinstance(cell_value, (int, float)):
-                        max_xh = max(max_xh, int(cell_value))
-                    elif isinstance(cell_value, str) and cell_value.strip().isdigit():
-                        max_xh = max(max_xh, int(cell_value.strip()))
-            
-            # 准备政策信息
-            policy_id = policy.get("ID", "")
-            source_department = policy.get("ResponsibleDepartment", policy.get("IssuingAuthority", ""))
-            policy_name = policy.get("Remarks", policy.get("PolicyFileName", ""))
-            document_number = policy.get("DocumentNumber", "")
-            fields = policy.get("Fields", "")
-            remarks = policy.get("Remarks", "")
-            
-            # 保存每个问答对
-            for idx, qa_pair in enumerate(qa_pairs):
-                row_data = []
-                for key in header_keys:
-                    if key == "XH":
-                        value = max_xh + idx + 1
-                    elif key == "ID":
-                        value = policy_id
-                    elif key == "SourceDepartment":
-                        value = source_department
-                    elif key == "Problem":
-                        value = qa_pair.get("question", "")
-                    elif key == "Answer":
-                        value = qa_pair.get("answer", "")
-                    elif key == "PolicyName":
-                        value = policy_name
-                    elif key == "DocumentNumber":
-                        value = document_number
-                    elif key == "Fields":
-                        value = fields
-                    elif key == "Remarks":
-                        value = remarks
-                    else:
-                        value = ""
-                    
-                    row_data.append(value)
                 
+                # 获取当前最大序号
+                max_xh = 0
+                if "XH" in header_keys:
+                    xh_col = header_keys.index("XH") + 1
+                    for row in range(2, ws.max_row + 1):
+                        cell_value = ws.cell(row, xh_col).value
+                        if isinstance(cell_value, (int, float)):
+                            max_xh = max(max_xh, int(cell_value))
+                        elif isinstance(cell_value, str) and cell_value.strip().isdigit():
+                            max_xh = max(max_xh, int(cell_value.strip()))
+                
+                # 准备政策信息
+                policy_id = policy.get("ID", "")
+                source_department = policy.get("ResponsibleDepartment", policy.get("IssuingAuthority", ""))
+                policy_name = policy.get("Remarks", policy.get("PolicyFileName", ""))
+                document_number = policy.get("DocumentNumber", "")
+                fields = policy.get("Fields", "")
+                remarks = policy.get("Remarks", "")
+                
+                # 保存每个问答对
+                for idx, qa_pair in enumerate(qa_pairs):
+                    row_data = []
+                    for key in header_keys:
+                        if key == "XH":
+                            value = max_xh + idx + 1
+                        elif key == "ID":
+                            value = policy_id
+                        elif key == "SourceDepartment":
+                            value = source_department
+                        elif key == "Problem":
+                            value = qa_pair.get("question", "")
+                        elif key == "Answer":
+                            value = qa_pair.get("answer", "")
+                        elif key == "PolicyName":
+                            value = policy_name
+                        elif key == "DocumentNumber":
+                            value = document_number
+                        elif key == "Fields":
+                            value = fields
+                        elif key == "Remarks":
+                            value = remarks
+                        else:
+                            value = ""
+                        
+                        row_data.append(value)
+                    
                 ws.append(row_data)
-            
-            # 保存文件
-            wb.save(output_file)
-            logger.info(f"成功保存 {len(qa_pairs)} 个问答对到: {output_file.name}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"保存问答对失败: {e}")
-            return False
+                
+                # 保存文件
+                wb.save(output_file)
+                logger.info(f"成功保存 {len(qa_pairs)} 个问答对到: {output_file.name}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"保存问答对失败: {e}")
+                return False
 

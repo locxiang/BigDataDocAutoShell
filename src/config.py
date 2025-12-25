@@ -31,6 +31,9 @@ MODEL_NAME = os.getenv("MODEL_NAME", "gpt-3.5-turbo")
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
 
+# 并发配置
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))  # 默认5个并发线程
+
 # Excel模板文件映射
 TEMPLATE_MAPPING = {
     "办会材料信息": "2办会材料信息.xlsx",
