@@ -3,6 +3,7 @@ import sys
 import logging
 import time
 import threading
+import shutil
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -142,7 +143,10 @@ class DocumentProcessor:
             if not success:
                 raise ValueError("数据保存失败")
             
-            # 5. 成功
+            # 5. 复制文件到分类文件夹
+            self._copy_file_to_category_folder(file_path, doc_type)
+            
+            # 6. 成功
             self.update_status(index, total, '成功', file_name, f"→ {doc_type}")
             self._render_display(index, total, file_name, f"✓ 处理成功 → {doc_type}")
             return True
@@ -164,6 +168,29 @@ class DocumentProcessor:
                 })
             self._render_display(index, total, file_name, f"✗ 处理失败 - {simplified_error}")
             return False
+    
+    def _copy_file_to_category_folder(self, file_path: Path, doc_type: str):
+        """
+        将文件复制到output目录下对应的分类文件夹中
+        
+        Args:
+            file_path: 原始文件路径
+            doc_type: 文档类型（办会材料信息、办文材料信息、政策文件信息）
+        """
+        try:
+            # 创建分类文件夹路径
+            category_folder = OUTPUT_DIR / doc_type
+            category_folder.mkdir(parents=True, exist_ok=True)
+            
+            # 目标文件路径
+            target_path = category_folder / file_path.name
+            
+            # 复制文件（如果目标文件已存在，则覆盖）
+            shutil.copy2(file_path, target_path)
+            logger.info(f"文件已复制到分类文件夹: {file_path.name} -> {category_folder}")
+        except Exception as e:
+            # 复制失败不影响主流程，只记录日志
+            logger.warning(f"复制文件到分类文件夹失败: {file_path.name}, 错误: {e}")
     
     def _simplify_error(self, error_msg: str, file_name: str) -> str:
         """
