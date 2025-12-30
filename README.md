@@ -50,6 +50,27 @@ python generate_qa.py
 - 为每个政策生成 10 个问答对
 - 将问答对保存到 `output/5政策问答对.xlsx`
 
+#### 3.3 批量上传文件
+
+批量并行上传文件到服务器：
+
+```bash
+python upload_files.py
+```
+
+该程序会：
+- 递归扫描指定目录及其所有子目录下的文件（支持 .xlsx, .xls, .docx, .doc, .pdf）
+- 并发上传文件到指定接口
+- 上传成功后自动删除本地文件
+- 失败的文件会进行重试（可配置重试次数）
+
+**配置说明**（在 `.env` 文件中配置）：
+- `UPLOAD_DIR`: 待上传文件夹路径（默认：`data`）
+- `UPLOAD_URL`: 上传接口URL（必填，例如：`https://example.com/easy-db-web/api/open/excelUpload`）
+- `UPLOAD_TOKEN`: 上传token（必填）
+- `UPLOAD_MAX_WORKERS`: 并发上传数量（默认：5）
+- `UPLOAD_MAX_RETRIES`: 上传失败重试次数（默认：3）
+
 ## 使用说明
 
 1. 将待处理的文档放入 `data/` 目录
@@ -85,6 +106,7 @@ python generate_qa.py
 
 - `processing.log` - 文档处理日志（main.py）
 - `qa_generation.log` - 问答对生成日志（generate_qa.py）
+- `upload.log` - 文件上传日志（upload_files.py）
 
 ## 政策问答对生成说明
 
