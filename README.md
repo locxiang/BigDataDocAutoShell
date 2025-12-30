@@ -71,6 +71,50 @@ python upload_files.py
 - `UPLOAD_MAX_WORKERS`: 并发上传数量（默认：5）
 - `UPLOAD_MAX_RETRIES`: 上传失败重试次数（默认：3）
 
+#### 3.4 文件去重
+
+对 `output/` 目录中的文件进行去重，基于文件 hash 值识别重复文件：
+
+```bash
+python deduplicate.py
+```
+
+该程序会：
+- 扫描 `output/` 目录下三个分类文件夹（办会材料信息、办文材料信息、政策文件信息）中的所有文档文件
+- 计算每个文件的 MD5 hash 值
+- 识别重复文件（hash 值相同的文件）
+- **保留策略**：保留最早的文件（按修改时间），删除其他重复文件
+- 自动删除 Excel 文件中对应的行数据（根据 `PolicyFileName` 字段匹配）
+- 如果删除的是政策文件，还会删除 `5政策问答对.xlsx` 中关联的问答对（根据 `ID` 字段匹配）
+
+**注意事项**：
+- 执行前建议先备份 `output/` 目录
+- 程序会显示将要删除的文件列表，需要确认后才会执行删除操作
+- 所有操作都会记录到 `deduplicate.log` 日志文件中
+
+#### 3.5 文件名规范化
+
+规范化 `output/` 目录中的文件名，处理空格和括号问题：
+
+```bash
+python normalize_filenames.py
+```
+
+该程序会：
+- 扫描 `output/` 目录下三个分类文件夹（办会材料信息、办文材料信息、政策文件信息）中的所有文档文件
+- 检查文件名是否需要规范化
+- **规范化规则**：
+  - 空格、Tab等空白字符 → 下划线 `_`
+  - 英文圆括号 `()` → 中文圆括号 `（）`
+- 重命名文件
+- 自动更新 Excel 文件中对应的 `PolicyFileName` 字段值
+
+**注意事项**：
+- 执行前建议先备份 `output/` 目录
+- 程序会显示将要处理的文件列表，需要确认后才会执行操作
+- 所有操作都会记录到 `normalize_filenames.log` 日志文件中
+- 如果目标文件名已存在，会跳过重命名以避免覆盖
+
 ## 使用说明
 
 1. 将待处理的文档放入 `data/` 目录
@@ -107,6 +151,8 @@ python upload_files.py
 - `processing.log` - 文档处理日志（main.py）
 - `qa_generation.log` - 问答对生成日志（generate_qa.py）
 - `upload.log` - 文件上传日志（upload_files.py）
+- `deduplicate.log` - 文件去重日志（deduplicate.py）
+- `normalize_filenames.log` - 文件名规范化日志（normalize_filenames.py）
 
 ## 政策问答对生成说明
 
