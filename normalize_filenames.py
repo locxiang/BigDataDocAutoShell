@@ -2,8 +2,11 @@
 import sys
 import logging
 import re
+import hashlib
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openpyxl import load_workbook
 from src.config import OUTPUT_DIR, TEMPLATE_MAPPING
 
@@ -75,7 +78,7 @@ class FilenameNormalizer:
     
     def needs_normalization(self, filename: str) -> bool:
         """
-        检查文件名是否需要规范化
+        检查文件名是否需要规范化（快速检查，不计算规范化结果）
         
         Args:
             filename: 文件名
@@ -83,17 +86,25 @@ class FilenameNormalizer:
         Returns:
             是否需要规范化
         """
-        normalized = self.normalize_filename(filename)
-        return normalized != filename
+        # 快速检查：是否存在空白字符或英文括号
+        path_obj = Path(filename)
+        stem = path_obj.stem
+        # 检查是否有空白字符
+        if re.search(r'\s', stem):
+            return True
+        # 检查是否有英文括号
+        if '(' in stem or ')' in stem:
+            return True
+        return False
     
-    def scan_files(self) -> List[Tuple[Path, str]]:
+    def scan_files(self) -> Dict[str, List[Tuple[Path, str]]]:
         """
-        扫描output目录下的所有文档文件
+        扫描output目录下的所有文档文件，按分类分组
         
         Returns:
-            列表，每个元素为(文件路径, 分类名称)
+            字典，key为分类名称，value为该分类下需要处理的文件列表
         """
-        files_to_process = []
+        files_by_category = defaultdict(list)
         
         # 扫描三个分类文件夹
         for category in self.CATEGORY_TO_EXCEL.keys():
@@ -111,9 +122,9 @@ class FilenameNormalizer:
                     
                     # 检查是否需要规范化
                     if self.needs_normalization(file_path.name):
-                        files_to_process.append((file_path, category))
+                        files_by_category[category].append((file_path, category))
         
-        return files_to_process
+        return files_by_category
     
     def rename_file(self, file_path: Path, new_filename: str) -> bool:
         """
@@ -164,14 +175,13 @@ class FilenameNormalizer:
         # 如果没有括号，直接返回
         return header.strip()
     
-    def update_excel_filename(self, excel_file: Path, old_filename_without_ext: str, new_filename_without_ext: str) -> int:
+    def batch_update_excel_filenames(self, excel_file: Path, filename_mappings: Dict[str, str]) -> int:
         """
-        更新Excel中PolicyFileName字段的值
+        批量更新Excel中PolicyFileName字段的值（优化版本：只打开一次Excel文件）
         
         Args:
             excel_file: Excel文件路径
-            old_filename_without_ext: 旧文件名（不含扩展名）
-            new_filename_without_ext: 新文件名（不含扩展名）
+            filename_mappings: 文件名映射字典，key为旧文件名（不含扩展名），value为新文件名（不含扩展名）
             
         Returns:
             更新的行数
@@ -180,7 +190,11 @@ class FilenameNormalizer:
             logger.warning(f"Excel文件不存在: {excel_file}")
             return 0
         
+        if not filename_mappings:
+            return 0
+        
         try:
+            logger.info(f"打开Excel文件进行批量更新: {excel_file.name}，共 {len(filename_mappings)} 个文件名需要更新")
             wb = load_workbook(excel_file)
             if "YS" not in wb.sheetnames:
                 logger.warning(f"Excel文件中没有YS Sheet: {excel_file}")
@@ -206,67 +220,237 @@ class FilenameNormalizer:
                 wb.close()
                 return 0
             
-            # 查找匹配的行并更新
+            # 批量查找匹配的行并更新（使用字典快速查找）
             updated_count = 0
             for row_idx in range(2, ws.max_row + 1):
                 cell_value = ws.cell(row_idx, policy_filename_col).value
                 if cell_value:
                     # 比较文件名（不含扩展名）
                     cell_filename = str(cell_value).strip()
-                    if cell_filename == old_filename_without_ext:
+                    if cell_filename in filename_mappings:
                         # 更新为新文件名
-                        ws.cell(row_idx, policy_filename_col).value = new_filename_without_ext
+                        new_filename = filename_mappings[cell_filename]
+                        ws.cell(row_idx, policy_filename_col).value = new_filename
                         updated_count += 1
-                        logger.info(f"更新Excel行 {row_idx}: {old_filename_without_ext} -> {new_filename_without_ext}")
+                        logger.debug(f"更新Excel行 {row_idx}: {cell_filename} -> {new_filename}")
             
             if updated_count > 0:
                 wb.save(excel_file)
-                logger.info(f"从 {excel_file.name} 中更新了 {updated_count} 行数据")
+                logger.info(f"从 {excel_file.name} 中批量更新了 {updated_count} 行数据")
             
             wb.close()
             return updated_count
             
         except Exception as e:
-            logger.error(f"更新Excel失败: {excel_file}, 错误: {e}")
+            logger.error(f"批量更新Excel失败: {excel_file}, 错误: {e}")
             return 0
     
-    def process_files(self, files_to_process: List[Tuple[Path, str]]):
+    def check_and_resolve_duplicates(self, files_list: List[Tuple[Path, str]], category_dir: Path) -> Dict[Path, str]:
         """
-        处理文件：重命名并更新Excel
+        检查并解决重复文件名问题（优化版本：排序后只检查相邻文件）
         
         Args:
-            files_to_process: 需要处理的文件列表
+            files_list: 需要处理的文件列表
+            category_dir: 分类目录路径
+            
+        Returns:
+            文件名映射字典，key为文件路径，value为最终确定的新文件名
         """
-        for file_path, category in files_to_process:
-            try:
-                # 1. 计算新文件名
-                old_filename = file_path.name
-                new_filename = self.normalize_filename(old_filename)
-                
-                # 2. 提取文件名（不含扩展名）
-                old_filename_without_ext = Path(old_filename).stem
-                new_filename_without_ext = Path(new_filename).stem
-                
-                logger.info(f"处理文件: {old_filename} -> {new_filename}")
-                
-                # 3. 重命名文件
-                if self.rename_file(file_path, new_filename):
-                    self.stats['files_renamed'] += 1
-                    
-                    # 4. 更新Excel中的PolicyFileName字段
-                    excel_file = self.output_dir / self.CATEGORY_TO_EXCEL[category]
-                    updated_rows = self.update_excel_filename(
-                        excel_file,
-                        old_filename_without_ext,
-                        new_filename_without_ext
-                    )
-                    self.stats['excel_rows_updated'] += updated_rows
+        # 1. 计算所有新文件名并创建(文件名, 文件路径)元组列表
+        file_info_list = []
+        for file_path, _ in files_list:
+            old_filename = file_path.name
+            new_filename = self.normalize_filename(old_filename)
+            file_info_list.append((new_filename, file_path))
+        
+        # 2. 按文件名排序（排序后重复的文件名会聚集在一起）
+        file_info_list.sort(key=lambda x: x[0])
+        
+        # 3. 获取目录中已存在的文件名（用于检查冲突，排除当前正在处理的文件）
+        existing_files = set()
+        processing_filenames = {file_path.name for _, file_path in file_info_list}
+        if category_dir.exists():
+            for existing_file in category_dir.iterdir():
+                if existing_file.is_file() and existing_file.suffix.lower() in self.DOC_EXTENSIONS:
+                    # 排除当前正在处理的文件（避免误判）
+                    if existing_file.name not in processing_filenames:
+                        existing_files.add(existing_file.name)
+        
+        # 4. 遍历排序后的列表，只检查相邻文件是否有重复（优化性能）
+        resolved_names = {}
+        used_names = set()  # 已使用的文件名集合
+        
+        i = 0
+        while i < len(file_info_list):
+            new_filename, file_path = file_info_list[i]
+            
+            # 检查当前文件名是否与已存在的文件冲突
+            if new_filename in existing_files:
+                # 与已存在文件冲突，需要添加序号
+                base_name = Path(new_filename).stem
+                suffix = Path(new_filename).suffix
+                counter = 1
+                candidate_name = f"{base_name}_{counter}{suffix}"
+                while candidate_name in existing_files or candidate_name in used_names:
+                    counter += 1
+                    candidate_name = f"{base_name}_{counter}{suffix}"
+                resolved_names[file_path] = candidate_name
+                used_names.add(candidate_name)
+                logger.warning(f"文件名与已存在文件冲突，添加序号: {new_filename} -> {candidate_name}")
+                i += 1
+                continue
+            
+            # 检查后续相邻文件是否有重复（排序后重复文件会聚集在一起）
+            # 由于已排序，只需要检查相邻的文件即可，遇到不同的文件名就可以停止
+            duplicate_count = 1
+            duplicate_files = [(file_path, new_filename)]
+            
+            # 检查后续相邻文件，直到遇到不同的文件名（排序后重复文件会连续出现）
+            for j in range(i + 1, len(file_info_list)):
+                next_filename, next_file_path = file_info_list[j]
+                if next_filename == new_filename:
+                    duplicate_count += 1
+                    duplicate_files.append((next_file_path, next_filename))
                 else:
-                    self.stats['errors'] += 1
+                    # 由于已排序，如果不同则后续不会有重复，可以停止检查
+                    break
+            
+            if duplicate_count == 1:
+                # 没有重复，直接使用
+                if new_filename not in used_names:
+                    resolved_names[file_path] = new_filename
+                    used_names.add(new_filename)
+                else:
+                    # 与已分配的名称冲突，添加序号
+                    base_name = Path(new_filename).stem
+                    suffix = Path(new_filename).suffix
+                    counter = 1
+                    candidate_name = f"{base_name}_{counter}{suffix}"
+                    while candidate_name in existing_files or candidate_name in used_names:
+                        counter += 1
+                        candidate_name = f"{base_name}_{counter}{suffix}"
+                    resolved_names[file_path] = candidate_name
+                    used_names.add(candidate_name)
+                    logger.info(f"文件名与已分配名称冲突，添加序号: {new_filename} -> {candidate_name}")
+            else:
+                # 有重复，需要添加序号区分
+                base_name = Path(new_filename).stem
+                suffix = Path(new_filename).suffix
+                counter = 0
+                
+                for dup_file_path, dup_filename in duplicate_files:
+                    if counter == 0:
+                        # 第一个文件保持原名（如果可用）
+                        if new_filename not in used_names:
+                            resolved_names[dup_file_path] = new_filename
+                            used_names.add(new_filename)
+                        else:
+                            counter = 1
+                            candidate_name = f"{base_name}_{counter}{suffix}"
+                            while candidate_name in existing_files or candidate_name in used_names:
+                                counter += 1
+                                candidate_name = f"{base_name}_{counter}{suffix}"
+                            resolved_names[dup_file_path] = candidate_name
+                            used_names.add(candidate_name)
+                            logger.info(f"文件名重复，添加序号: {new_filename} -> {candidate_name}")
+                    else:
+                        # 后续文件添加序号
+                        candidate_name = f"{base_name}_{counter}{suffix}"
+                        while candidate_name in existing_files or candidate_name in used_names:
+                            counter += 1
+                            candidate_name = f"{base_name}_{counter}{suffix}"
+                        resolved_names[dup_file_path] = candidate_name
+                        used_names.add(candidate_name)
+                        logger.info(f"文件名重复，添加序号: {new_filename} -> {candidate_name}")
+                    counter += 1
+            
+            i += duplicate_count
+        
+        return resolved_names
+    
+    def rename_file_worker(self, file_path: Path, new_filename: str) -> Tuple[bool, str, str]:
+        """
+        文件重命名工作函数（用于并行处理）
+        
+        Args:
+            file_path: 原文件路径
+            new_filename: 新文件名
+            
+        Returns:
+            (是否成功, 旧文件名不含扩展名, 新文件名不含扩展名)
+        """
+        try:
+            old_filename = file_path.name
+            old_filename_without_ext = Path(old_filename).stem
+            new_filename_without_ext = Path(new_filename).stem
+            
+            # 快速检查：只检查目标文件是否已存在（不检查整个目录）
+            new_path = file_path.parent / new_filename
+            if new_path.exists() and new_path != file_path:
+                logger.warning(f"目标文件已存在，跳过重命名: {new_path}")
+                return (False, old_filename_without_ext, new_filename_without_ext)
+            
+            if self.rename_file(file_path, new_filename):
+                return (True, old_filename_without_ext, new_filename_without_ext)
+            else:
+                return (False, old_filename_without_ext, new_filename_without_ext)
+        except Exception as e:
+            logger.error(f"重命名文件失败: {file_path}, 错误: {e}")
+            return (False, "", "")
+    
+    def process_files(self, files_by_category: Dict[str, List[Tuple[Path, str]]]):
+        """
+        处理文件：重命名并批量更新Excel（优化版本）
+        
+        Args:
+            files_by_category: 按分类分组的文件字典
+        """
+        # 按分类处理，每个分类的Excel文件只打开一次
+        for category, files_list in files_by_category.items():
+            if not files_list:
+                continue
+            
+            logger.info(f"处理分类 '{category}'，共 {len(files_list)} 个文件")
+            
+            # 1. 检查并解决重复文件名（排序后只检查相邻文件，优化性能）
+            category_dir = self.output_dir / category
+            logger.info(f"检查文件名重复情况...")
+            resolved_names = self.check_and_resolve_duplicates(files_list, category_dir)
+            
+            # 2. 并行重命名文件（文件系统操作可以并行）
+            rename_results = []
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_file = {}
+                for file_path, _ in files_list:
+                    if file_path not in resolved_names:
+                        logger.warning(f"文件未在解析列表中，跳过: {file_path}")
+                        continue
                     
-            except Exception as e:
-                logger.error(f"处理文件失败: {file_path}, 错误: {e}")
-                self.stats['errors'] += 1
+                    new_filename = resolved_names[file_path]
+                    old_filename = file_path.name
+                    future = executor.submit(self.rename_file_worker, file_path, new_filename)
+                    future_to_file[future] = (file_path, old_filename, new_filename)
+                
+                for future in as_completed(future_to_file):
+                    file_path, old_filename, new_filename = future_to_file[future]
+                    try:
+                        success, old_name_no_ext, new_name_no_ext = future.result()
+                        if success:
+                            self.stats['files_renamed'] += 1
+                            rename_results.append((old_name_no_ext, new_name_no_ext))
+                            logger.info(f"文件重命名成功: {old_filename} -> {new_filename}")
+                        else:
+                            self.stats['errors'] += 1
+                    except Exception as e:
+                        logger.error(f"处理文件失败: {file_path}, 错误: {e}")
+                        self.stats['errors'] += 1
+            
+            # 3. 批量更新Excel（每个分类的Excel文件只打开一次）
+            if rename_results:
+                excel_file = self.output_dir / self.CATEGORY_TO_EXCEL[category]
+                filename_mappings = {old: new for old, new in rename_results}
+                updated_rows = self.batch_update_excel_filenames(excel_file, filename_mappings)
+                self.stats['excel_rows_updated'] += updated_rows
     
     def print_summary(self):
         """打印统计信息"""
@@ -294,25 +478,35 @@ class FilenameNormalizer:
             
             # 1. 扫描文件
             print("步骤1: 扫描文件...")
-            files_to_process = self.scan_files()
+            files_by_category = self.scan_files()
+            total_files_to_process = sum(len(files) for files in files_by_category.values())
             print(f"扫描完成，共找到 {self.stats['total_files']} 个文件")
-            print(f"需要规范化的文件: {len(files_to_process)} 个")
+            print(f"需要规范化的文件: {total_files_to_process} 个")
             print()
             
-            if len(files_to_process) == 0:
+            if total_files_to_process == 0:
                 print("没有需要规范化的文件，退出")
                 return
             
-            # 2. 显示将要处理的文件列表
-            print("将要处理的文件列表:")
-            for file_path, category in files_to_process:
-                old_filename = file_path.name
-                new_filename = self.normalize_filename(old_filename)
-                print(f"  [{category}] {old_filename} -> {new_filename}")
+            # 2. 显示将要处理的文件列表（只显示前50个，避免输出过多）
+            print("将要处理的文件列表（显示前50个）:")
+            display_count = 0
+            for category, files_list in files_by_category.items():
+                for file_path, _ in files_list:
+                    if display_count >= 50:
+                        break
+                    old_filename = file_path.name
+                    new_filename = self.normalize_filename(old_filename)
+                    print(f"  [{category}] {old_filename} -> {new_filename}")
+                    display_count += 1
+                if display_count >= 50:
+                    break
+            if total_files_to_process > 50:
+                print(f"  ... 还有 {total_files_to_process - 50} 个文件未显示")
             print()
             
             # 3. 确认操作
-            response = input(f"是否继续处理 {len(files_to_process)} 个文件？(y/n): ").strip().lower()
+            response = input(f"是否继续处理 {total_files_to_process} 个文件？(y/n): ").strip().lower()
             
             if response != 'y':
                 print("操作已取消")
@@ -320,9 +514,9 @@ class FilenameNormalizer:
             
             print()
             
-            # 4. 处理文件
-            print("步骤2: 重命名文件并更新Excel...")
-            self.process_files(files_to_process)
+            # 4. 处理文件（批量处理，优化性能）
+            print("步骤2: 重命名文件并批量更新Excel...")
+            self.process_files(files_by_category)
             print()
             
             # 5. 打印统计信息
