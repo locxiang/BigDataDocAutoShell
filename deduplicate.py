@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Set
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openpyxl import load_workbook
 from src.config import OUTPUT_DIR, TEMPLATE_MAPPING
 
@@ -67,14 +68,15 @@ class Deduplicator:
     
     def scan_files(self) -> Dict[str, List[Path]]:
         """
-        扫描output目录下的所有文档文件
+        扫描output目录下的所有文档文件（优化版本：并行计算hash）
         
         Returns:
             字典，key为hash值，value为文件路径列表
         """
         hash_to_files = defaultdict(list)
+        all_files = []
         
-        # 扫描三个分类文件夹
+        # 1. 先收集所有文件路径
         for category in self.CATEGORY_TO_EXCEL.keys():
             category_dir = self.output_dir / category
             if not category_dir.exists():
@@ -86,11 +88,25 @@ class Deduplicator:
             # 扫描该文件夹下的所有文档文件
             for file_path in category_dir.iterdir():
                 if file_path.is_file() and file_path.suffix.lower() in self.DOC_EXTENSIONS:
-                    file_hash = self.calculate_file_hash(file_path)
+                    all_files.append(file_path)
+                    self.stats['total_files'] += 1
+        
+        # 2. 并行计算文件hash（使用线程池）
+        logger.info(f"开始并行计算 {len(all_files)} 个文件的hash值...")
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_file = {executor.submit(self.calculate_file_hash, file_path): file_path 
+                             for file_path in all_files}
+            
+            for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
+                try:
+                    file_hash = future.result()
                     if file_hash:
                         hash_to_files[file_hash].append(file_path)
-                        self.stats['total_files'] += 1
+                except Exception as e:
+                    logger.error(f"计算文件hash失败: {file_path}, 错误: {e}")
         
+        logger.info(f"hash计算完成，共处理 {len(all_files)} 个文件")
         return hash_to_files
     
     def find_duplicates(self, hash_to_files: Dict[str, List[Path]]) -> List[Tuple[Path, List[Path]]]:
@@ -165,13 +181,13 @@ class Deduplicator:
             return parent_dir
         return None
     
-    def delete_excel_row_by_filename(self, excel_file: Path, filename_without_ext: str) -> int:
+    def batch_delete_excel_rows_by_filenames(self, excel_file: Path, filenames_without_ext: Set[str]) -> int:
         """
-        根据文件名删除Excel中对应的行
+        批量删除Excel中对应的行（优化版本：只打开一次Excel文件）
         
         Args:
             excel_file: Excel文件路径
-            filename_without_ext: 文件名（不含扩展名）
+            filenames_without_ext: 文件名集合（不含扩展名）
             
         Returns:
             删除的行数
@@ -180,7 +196,11 @@ class Deduplicator:
             logger.warning(f"Excel文件不存在: {excel_file}")
             return 0
         
+        if not filenames_without_ext:
+            return 0
+        
         try:
+            logger.info(f"打开Excel文件进行批量删除: {excel_file.name}，共 {len(filenames_without_ext)} 个文件名需要删除")
             wb = load_workbook(excel_file)
             if "YS" not in wb.sheetnames:
                 logger.warning(f"Excel文件中没有YS Sheet: {excel_file}")
@@ -214,7 +234,7 @@ class Deduplicator:
                 if cell_value:
                     # 比较文件名（不含扩展名）
                     cell_filename = str(cell_value).strip()
-                    if cell_filename == filename_without_ext:
+                    if cell_filename in filenames_without_ext:
                         rows_to_delete.append(row_idx)
             
             # 删除匹配的行
@@ -225,13 +245,13 @@ class Deduplicator:
             
             if deleted_count > 0:
                 wb.save(excel_file)
-                logger.info(f"从 {excel_file.name} 中删除了 {deleted_count} 行数据 (文件名: {filename_without_ext})")
+                logger.info(f"从 {excel_file.name} 中批量删除了 {deleted_count} 行数据")
             
             wb.close()
             return deleted_count
             
         except Exception as e:
-            logger.error(f"删除Excel行失败: {excel_file}, 错误: {e}")
+            logger.error(f"批量删除Excel行失败: {excel_file}, 错误: {e}")
             return 0
     
     def delete_qa_rows_by_policy_id(self, qa_excel_file: Path, policy_ids: Set[int]) -> int:
@@ -307,13 +327,13 @@ class Deduplicator:
             logger.error(f"删除问答对行失败: {qa_excel_file}, 错误: {e}")
             return 0
     
-    def get_policy_ids_by_filename(self, excel_file: Path, filename_without_ext: str) -> Set[int]:
+    def batch_get_policy_ids_by_filenames(self, excel_file: Path, filenames_without_ext: Set[str]) -> Set[int]:
         """
-        根据文件名获取政策ID列表
+        批量根据文件名获取政策ID列表（优化版本：只打开一次Excel文件）
         
         Args:
             excel_file: Excel文件路径
-            filename_without_ext: 文件名（不含扩展名）
+            filenames_without_ext: 文件名集合（不含扩展名）
             
         Returns:
             政策ID集合
@@ -321,6 +341,9 @@ class Deduplicator:
         policy_ids = set()
         
         if not excel_file.exists():
+            return policy_ids
+        
+        if not filenames_without_ext:
             return policy_ids
         
         try:
@@ -348,23 +371,25 @@ class Deduplicator:
                 wb.close()
                 return policy_ids
             
-            # 查找匹配的行，提取ID
+            # 批量查找匹配的行，提取ID（使用集合快速查找）
             for row_idx in range(2, ws.max_row + 1):
                 filename_value = ws.cell(row_idx, policy_filename_col).value
-                if filename_value and str(filename_value).strip() == filename_without_ext:
-                    id_value = ws.cell(row_idx, id_col).value
-                    if id_value:
-                        try:
-                            policy_id = int(id_value)
-                            policy_ids.add(policy_id)
-                        except (ValueError, TypeError):
-                            continue
+                if filename_value:
+                    cell_filename = str(filename_value).strip()
+                    if cell_filename in filenames_without_ext:
+                        id_value = ws.cell(row_idx, id_col).value
+                        if id_value:
+                            try:
+                                policy_id = int(id_value)
+                                policy_ids.add(policy_id)
+                            except (ValueError, TypeError):
+                                continue
             
             wb.close()
             return policy_ids
             
         except Exception as e:
-            logger.error(f"获取政策ID失败: {excel_file}, 错误: {e}")
+            logger.error(f"批量获取政策ID失败: {excel_file}, 错误: {e}")
             return policy_ids
     
     @staticmethod
@@ -391,41 +416,65 @@ class Deduplicator:
     
     def process_duplicates(self, duplicates: List[Tuple[Path, List[Path]]]):
         """
-        处理重复文件：删除文件并清理Excel数据
+        处理重复文件：删除文件并清理Excel数据（优化版本：批量处理）
         
         Args:
             duplicates: 重复文件列表
         """
-        # 用于收集政策文件的ID（用于删除问答对）
-        policy_ids_to_delete = set()
+        # 按分类分组要删除的文件
+        files_by_category = defaultdict(list)
+        policy_files_to_delete = set()  # 政策文件集合（用于批量获取ID）
         
+        # 1. 收集所有要删除的文件，按分类分组
         for keep_file, delete_files in duplicates:
             category = self.get_category_from_path(keep_file)
             if not category:
                 logger.warning(f"无法确定文件分类，跳过: {keep_file}")
                 continue
             
+            for delete_file in delete_files:
+                files_by_category[category].append(delete_file)
+                if category == "政策文件信息":
+                    policy_files_to_delete.add(delete_file.stem)
+        
+        # 2. 批量获取政策文件的ID（只打开一次Excel）
+        policy_ids_to_delete = set()
+        if policy_files_to_delete:
+            policy_excel_file = self.output_dir / self.CATEGORY_TO_EXCEL["政策文件信息"]
+            policy_ids_to_delete = self.batch_get_policy_ids_by_filenames(
+                policy_excel_file, policy_files_to_delete
+            )
+            logger.info(f"批量获取到 {len(policy_ids_to_delete)} 个政策ID")
+        
+        # 3. 按分类批量删除Excel行和文件
+        for category, delete_files in files_by_category.items():
+            if not delete_files:
+                continue
+            
+            logger.info(f"处理分类 '{category}'，共 {len(delete_files)} 个文件需要删除")
             excel_file = self.output_dir / self.CATEGORY_TO_EXCEL[category]
             
-            # 处理每个要删除的文件
-            for delete_file in delete_files:
-                # 1. 提取文件名（不含扩展名）
-                filename_without_ext = delete_file.stem
+            # 收集文件名（不含扩展名）
+            filenames_without_ext = {f.stem for f in delete_files}
+            
+            # 批量删除Excel行（只打开一次Excel）
+            deleted_rows = self.batch_delete_excel_rows_by_filenames(excel_file, filenames_without_ext)
+            self.stats['excel_rows_deleted'] += deleted_rows
+            
+            # 并行删除文件（文件系统操作可以并行）
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_file = {executor.submit(self.delete_file, delete_file): delete_file 
+                                 for delete_file in delete_files}
                 
-                # 2. 如果是政策文件，先收集ID（在删除Excel行之前）
-                if category == "政策文件信息":
-                    policy_ids = self.get_policy_ids_by_filename(excel_file, filename_without_ext)
-                    policy_ids_to_delete.update(policy_ids)
-                
-                # 3. 删除Excel中对应的行
-                deleted_rows = self.delete_excel_row_by_filename(excel_file, filename_without_ext)
-                self.stats['excel_rows_deleted'] += deleted_rows
-                
-                # 4. 删除文件
-                if self.delete_file(delete_file):
-                    self.stats['files_deleted'] += 1
+                for future in as_completed(future_to_file):
+                    delete_file = future_to_file[future]
+                    try:
+                        if future.result():
+                            self.stats['files_deleted'] += 1
+                    except Exception as e:
+                        logger.error(f"删除文件失败: {delete_file}, 错误: {e}")
         
-        # 5. 删除政策问答对中关联的记录
+        # 4. 删除政策问答对中关联的记录
         if policy_ids_to_delete:
             qa_excel_file = self.output_dir / TEMPLATE_MAPPING["政策问答对"]
             deleted_qa_rows = self.delete_qa_rows_by_policy_id(qa_excel_file, policy_ids_to_delete)
