@@ -413,7 +413,8 @@ class QAGenerator:
                         
                         row_data.append(value)
                     
-                ws.append(row_data)
+                    # 将每个问答对追加到Excel中（必须在循环内部）
+                    ws.append(row_data)
                 
                 # 保存文件
                 wb.save(output_file)
